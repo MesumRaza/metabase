@@ -491,3 +491,30 @@
                    :field_ref    [:field-literal "sleep" :type/*]
                    :name         "sleep"}]
                  (mt/cols results))))))))
+
+(deftest truly-async-test
+  (mt/test-driver :postgres
+    (let [remaining (atom 60)]
+      (dotimes [i @remaining]
+        (future
+          ((mt/user->client :rasta) :post 202 "dataset" {:database (mt/id)
+                                                         :type     "native"
+                                                         :native   {:query "SELECT pg_sleep(3) AS sleep;"}})
+          ;; NOCOMMIT
+          (locking println (println "Remaining:" (swap! remaining dec)))))
+      (Thread/sleep 1000)
+      (let [start-time-ms (System/currentTimeMillis)]
+        (is (= {:status "ok"}
+               ((mt/user->client :rasta) :get 200 "health")))
+        (is (> @remaining 46))
+        (let [elapsed-ms (- (System/currentTimeMillis) start-time-ms)]
+          (println "elapsed-ms:" elapsed-ms) ; NOCOMMIT
+          (is (< elapsed-ms 100)))))))
+
+(deftest x-test
+  (mt/test-driver :postgres
+    (is (= [[""]]
+           (mt/rows
+             ((mt/user->client :rasta) :post 202 "dataset" {:database (mt/id)
+                                                            :type     "native"
+                                                            :native   {:query "SELECT pg_sleep(3) AS sleep;"}}))))))

@@ -36,36 +36,19 @@
     (log/warn (trs "Cannot save QueryExecution, missing :context"))
     (db/insert! QueryExecution (dissoc query-execution :json_query))))
 
-(def ^:private ^Long thread-pool-size 4)
-
-(def ^:private ^{:arglists '(^java.util.concurrent.ExecutorService [])} thread-pool
-  "Thread pool for asynchronously saving query executions."
-  (let [pool (delay
-               (Executors/newFixedThreadPool
-                thread-pool-size
-                (.build
-                 (doto (BasicThreadFactory$Builder.)
-                   (.namingPattern "save-query-execution-thread-pool-%d")
-                   ;; Daemon threads do not block shutdown of the JVM
-                   (.daemon true)
-                   ;; Save query executions should be lower priority than other stuff e.g. API responses
-                   (.priority Thread/MIN_PRIORITY)))))]
-    (fn [] @pool)))
-
 (defn- save-query-execution-async!
   "Asynchronously save a `QueryExecution` row containing `execution-info`. This is done when a query is finished, so
   regardless of whether results streaming is canceled, we want to continue the save; for this reason, we don't call
   `future-cancel` if we get a message to `canceled-chan` the way we normally do."
   ^Future [execution-info]
   (log/trace "Saving QueryExecution info asynchronously")
-  (let [execution-info (add-running-time execution-info)
-        ^Runnable task (bound-fn []
-                         (try
-                           (save-query-execution! execution-info)
-                           (catch Throwable e
-                             (log/error e (trs "Error saving query execution info"))))
-                         nil)]
-    (.submit (thread-pool) task)))
+  (let [execution-info (add-running-time execution-info)]
+    (future
+      (try
+        (save-query-execution! execution-info)
+        (catch Throwable e
+          (log/error e (trs "Error saving query execution info"))))
+      nil)))
 
 (defn- save-successful-query-execution-async! [query-execution result-rows]
   (save-query-execution-async! (assoc query-execution :result_rows result-rows)))

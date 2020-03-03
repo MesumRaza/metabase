@@ -8,8 +8,13 @@
              [config :as config]
              [util :as u]]
             [metabase.util.i18n :refer [trs]]
-            [ring.adapter.jetty :as ring-jetty])
-  (:import org.eclipse.jetty.server.Server))
+            [potemkin.types :as p.types]
+            [ring.adapter.jetty :as ring.jetty]
+            [ring.util.servlet :as ring.servlet])
+  (:import javax.servlet.AsyncContext
+           [javax.servlet.http HttpServletRequest HttpServletResponse]
+           [org.eclipse.jetty.server Request Server]
+           org.eclipse.jetty.server.handler.AbstractHandler))
 
 (defn- jetty-ssl-config []
   (m/filter-vals
@@ -48,22 +53,51 @@
   ^Server []
   @instance*)
 
+(p.types/defprotocol+ Response
+  (respond* [this ^HttpServletRequest request ^HttpServletResponse response request-map response-map]))
+
+(extend-protocol Response
+  Object
+  (respond* [_ ^HttpServletRequest request response _ response-map]
+    (ring.servlet/update-servlet-response response (.getAsyncContext request) response-map))
+
+  nil
+  (respond* [_ ^HttpServletRequest request response _ response-map]
+    (ring.servlet/update-servlet-response response (.getAsyncContext request) response-map)))
+
+(defn- ^AbstractHandler async-proxy-handler [handler timeout]
+  (proxy [AbstractHandler] []
+    (handle [_ ^Request base-request ^HttpServletRequest request ^HttpServletResponse response]
+      (let [^AsyncContext context (doto (.startAsync request)
+                                    (.setTimeout timeout))
+            request-map           (ring.servlet/build-request-map request)
+            raise                 (fn [^Throwable e]
+                                    (println "e:" e) ; NOCOMMIT
+                                    (.setHandled base-request true)
+                                    (.sendError response 500 (.getMessage e))
+                                    (.complete context))
+            respond               (fn [response-map]
+                                    (try
+                                      (respond* (:body response-map) request response request-map response-map)
+                                      (catch Throwable e
+                                        (raise e))))]
+        (try
+          (handler request-map respond raise)
+          (.setHandled base-request true)
+          (catch Throwable e
+            (raise e)))))))
+
 (defn create-server
   "Create a new async Jetty server with `handler` and `options`. Handy for creating the real Metabase web server, and
   creating one-off web servers for tests and REPL usage."
   ^Server [handler options]
-  (doto ^Server (#'ring-jetty/create-server (assoc options :async? true))
+  (doto ^Server (#'ring.jetty/create-server (assoc options :async? true))
     (.setHandler
-     (#'ring-jetty/async-proxy-handler
+     (async-proxy-handler
       handler
-      ;; if any API endpoint functions aren't at the very least returning a channel to fetch the results
-      ;; later after 10 minutes we're in serious trouble. (Almost everything 'slow' should be returning a
-      ;; channel before then, but some things like CSV downloads don't currently return channels at this
-      ;; time)
-      ;;
       ;; TODO - I suppose the default value should be moved to the `metabase.config` namespace?
       (or (config/config-int :mb-jetty-async-response-timeout)
-          (* 10 60 1000))))))
+          (u/minutes->ms 10))))))
 
 (defn start-web-server!
   "Start the embedded Jetty web server. Returns `:started` if a new server was started; `nil` if there was already a

@@ -2,22 +2,38 @@
   (:require [cheshire.core :as json]
             [clojure.core.async :as a]
             compojure.response
-            [metabase.util :as u]
+            [metabase
+             [server :as server]
+             [util :as u]]
             [potemkin.types :as p.types]
-            [pretty.core :as pretty]
-            [ring.core.protocols :as ring.protocols]
-            [ring.util.response :as ring.response])
-  (:import [java.io BufferedWriter FilterOutputStream OutputStream OutputStreamWriter]
+            [pretty.core :as pretty])
+  (:import [java.io BufferedWriter OutputStream OutputStreamWriter]
            java.nio.charset.StandardCharsets
            java.util.zip.GZIPOutputStream
-           org.eclipse.jetty.io.EofException))
+           [javax.servlet.http HttpServletRequest HttpServletResponse]
+           org.eclipse.jetty.server.HttpOutput))
+
+(def ^:private ^:dynamic ^HttpServletRequest  *http-request* nil)
+(def ^:private ^:dynamic ^HttpServletResponse *http-response* nil)
+
+(defn- output-stream ^HttpOutput []
+  (some-> *http-response* .getOutputStream))
+
+(defmacro ^:private with-output-stream [[os-binding] & body]
+  `(let [os# (output-stream)]
+     (try
+       (.reopen os#)
+       (let [~(vary-meta os-binding assoc :tag HttpOutput) os#]
+         ~@body)
+       (finally
+         (.softClose os# )))))
 
 (def ^:private keepalive-interval-ms
   "Interval between sending newline characters to keep Heroku from terminating requests like queries that take a long
   time to complete."
   (u/seconds->ms 1)) ; one second
 
-(defn- jetty-eof-canceling-output-stream
+#_(defn- jetty-eof-canceling-output-stream
   "Wraps an `OutputStream` and sends a message to `canceled-chan` if a jetty `EofException` is thrown when writing to
   the stream."
   ^OutputStream [^OutputStream os canceled-chan]
@@ -39,7 +55,7 @@
            (a/>!! canceled-chan ::cancel)
            (throw e)))))))
 
-(defn- keepalive-output-stream
+#_(defn- keepalive-output-stream
   "Wraps an `OutputStream` and writes keepalive newline bytes every interval until someone else starts writing to the
   stream."
   ^OutputStream [^OutputStream os write-keepalive-newlines?]
@@ -114,9 +130,10 @@
       (write-to-stream! f (dissoc options :gzip?) gzos finished-chan))
     (with-open-chan [canceled-chan (a/promise-chan)]
       (with-open [os os
-                  os (jetty-eof-canceling-output-stream os canceled-chan)
-                  os (keepalive-output-stream os write-keepalive-newlines?)]
+                  #_os #_(jetty-eof-canceling-output-stream os canceled-chan)
+                  #_os #_(keepalive-output-stream os write-keepalive-newlines?)]
 
+        (println "os:" os) ; NOCOMMIT
         (try
           (f os canceled-chan)
           (catch Throwable e
@@ -126,7 +143,8 @@
             (a/>!! finished-chan (if (a/poll! canceled-chan)
                                    :canceled
                                    :done))
-            (a/close! finished-chan)))))))
+            (a/close! finished-chan)
+            (.. *http-request* getAsyncContext complete)))))))
 
 ;; `ring.middleware.gzip` doesn't work on our StreamingResponse class.
 (defn- should-gzip-response?
@@ -134,38 +152,50 @@
   [{{:strs [accept-encoding]} :headers}]
   (re-find #"gzip|\*" accept-encoding))
 
-(declare render)
+(declare respond*)
 
 (p.types/deftype+ StreamingResponse [f options donechan]
   pretty/PrettyPrintable
   (pretty [_]
     (list (symbol (str (.getCanonicalName StreamingResponse) \.)) f options))
 
-  ;; both sync and async responses
-  ring.protocols/StreamableResponseBody
-  (write-body-to-stream [_ _ os]
-    (write-to-stream! f options os donechan))
+  server/Response
+  (respond* [this request response request-map response-map]
+    (respond* this request response request-map response-map))
 
   ;; sync responses only
   compojure.response/Renderable
   (render [this request]
-    (render this (should-gzip-response? request)))
+    this)
 
   ;; async responses only
   compojure.response/Sendable
-  (send* [this request respond _]
-    (respond (compojure.response/render this request))))
+  (send* [this _ respond _]
+    (respond this)))
 
-(defn- render [^StreamingResponse streaming-response gzip?]
-  (let [{:keys [headers content-type], :as options} (.options streaming-response)]
-    (assoc (ring.response/response (if gzip?
-                                     (StreamingResponse. (.f streaming-response)
-                                                         (assoc options :gzip? true)
-                                                         (.donechan streaming-response))
-                                     streaming-response))
-           :headers      (cond-> (assoc headers "Content-Type" content-type)
-                           gzip? (assoc "Content-Encoding" "gzip"))
-           :status       202)))
+(defn- respond* [^StreamingResponse streaming-response ^HttpServletRequest request ^HttpServletResponse response request-map {response-headers :headers}]
+  (let [gzip?                                       (should-gzip-response? request-map)
+        {:keys [headers content-type], :as options} (.options streaming-response)
+        streaming-response                          (if gzip?
+                                                      (StreamingResponse. (.f streaming-response)
+                                                                          (assoc options :gzip? true)
+                                                                          (.donechan streaming-response))
+                                                      streaming-response)
+        headers                                     (cond-> (assoc headers "Content-Type" content-type)
+                                                      gzip? (assoc "Content-Encoding" "gzip"))]
+    (.setStatus response 202)
+    (println "headers:" (u/pprint-to-str 'blue (merge response-headers headers))) ; NOCOMMIT
+    (doseq [[k v] (merge response-headers headers)]
+      (.setHeader response (str k) (str v)))
+    (binding [*http-request*  request
+              *http-response* response]
+      (future
+        (try
+          (write-to-stream! (.f streaming-response) (.options streaming-response) (.getOutputStream response) (.donechan streaming-response))
+          (catch Throwable e
+            (println "e:" e)              ; NOCOMMIT
+            (.sendError response 500 (.getMessage e))
+            (.complete (.getAsyncContext request))))))))
 
 (defn finished-chan
   "Fetch a promise channel that will get a message when a `StreamingResponse` is completely finished. Provided primarily
